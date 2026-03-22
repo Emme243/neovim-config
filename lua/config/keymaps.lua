@@ -21,6 +21,6 @@ map("n", "[d", vim.diagnostic.goto_prev, { desc = "Prev Diagnostic" })
 map("n", "]d", vim.diagnostic.goto_next, { desc = "Next Diagnostic" })
 
 -- Format
-map("n", "<leader>ff", function()
+map("n", "<leader>rf", function()
   vim.lsp.buf.format({ async = true })
 end, { desc = "Format File" })
