@@ -10,4 +10,3 @@ vim.cmd("set shiftwidth=2")
 vim.opt.clipboard = "unnamedplus"
 vim.wo.number = true
 vim.wo.relativenumber = true
-
