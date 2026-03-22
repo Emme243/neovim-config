@@ -10,31 +10,12 @@ return {
 		dependencies = {
 			"mason-org/mason.nvim",
 			"neovim/nvim-lspconfig",
-		},
-		config = function()
-			require("mason-lspconfig").setup({
-				ensure_installed = {
-					"vtsls",
-					"vue_ls",
-					"lua_ls",
-					"pyright",
-					"jsonls",
-					"html",
-					"cssls",
-				},
-			})
-		end,
-	},
-	{
-		"neovim/nvim-lspconfig",
-		dependencies = {
-			"mason-org/mason.nvim",
-			"mason-org/mason-lspconfig.nvim",
 			"hrsh7th/cmp-nvim-lsp",
 		},
 		config = function()
 			local capabilities = require("cmp_nvim_lsp").default_capabilities()
-			local lspconfig = require("lspconfig")
+			local vue_language_server_path = vim.fn.stdpath("data")
+				.. "/mason/packages/vue-language-server/node_modules/@vue/language-server"
 
 			vim.lsp.handlers["textDocument/hover"] = vim.lsp.with(vim.lsp.handlers.hover, {
 				border = "rounded",
@@ -42,17 +23,8 @@ return {
 			vim.lsp.handlers["textDocument/signatureHelp"] = vim.lsp.with(vim.lsp.handlers.signature_help, {
 				border = "rounded",
 			})
-			local vue_language_server_path = vim.fn.stdpath("data")
-				.. "/mason/packages/vue-language-server/node_modules/@vue/language-server"
 
-			local vue_plugin = {
-				name = "@vue/typescript-plugin",
-				location = vue_language_server_path,
-				languages = { "vue" },
-				configNamespace = "typescript",
-			}
-
-			lspconfig.vtsls.setup({
+			vim.lsp.config("vtsls", {
 				filetypes = {
 					"javascript",
 					"javascriptreact",
@@ -66,7 +38,13 @@ return {
 					vtsls = {
 						tsserver = {
 							globalPlugins = {
-								vue_plugin,
+								{
+									name = "@vue/typescript-plugin",
+									location = vue_language_server_path,
+									languages = { "vue" },
+									configNamespace = "typescript",
+									enableForWorkspaceTypeScriptVersions = true,
+								},
 							},
 						},
 					},
@@ -74,9 +52,11 @@ return {
 				capabilities = capabilities,
 			})
 
-			lspconfig.vue_ls.setup({ capabilities = capabilities })
+			vim.lsp.config("vue_ls", {
+				capabilities = capabilities,
+			})
 
-			lspconfig.lua_ls.setup({
+			vim.lsp.config("lua_ls", {
 				settings = {
 					Lua = {
 						diagnostics = {
@@ -90,10 +70,24 @@ return {
 				},
 				capabilities = capabilities,
 			})
-			lspconfig.pyright.setup({ capabilities = capabilities })
-			lspconfig.jsonls.setup({ capabilities = capabilities })
-			lspconfig.html.setup({ capabilities = capabilities })
-			lspconfig.cssls.setup({ capabilities = capabilities })
+
+			vim.lsp.config("pyright", { capabilities = capabilities })
+			vim.lsp.config("jsonls", { capabilities = capabilities })
+			vim.lsp.config("html", { capabilities = capabilities })
+			vim.lsp.config("cssls", { capabilities = capabilities })
+
+			require("mason-lspconfig").setup({
+				ensure_installed = {
+					"vtsls",
+					"vue_ls",
+					"lua_ls",
+					"pyright",
+					"jsonls",
+					"html",
+					"cssls",
+				},
+			})
 		end,
 	},
+	{ "neovim/nvim-lspconfig" },
 }
