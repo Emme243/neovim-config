@@ -39,6 +39,12 @@ vim.api.nvim_create_autocmd("BufWritePre", {
 		if not buf_has_formatter(buf) then
 			return
 		end
-		vim.lsp.buf.format({ bufnr = buf, async = false })
+		vim.lsp.buf.format({
+			bufnr = buf,
+			async = false,
+			filter = function(client)
+				return client.name == "null-ls"
+			end,
+		})
 	end,
 })
