@@ -1,4 +1,5 @@
 require("config.vim-setup")
 require("config.keymaps")
+require("config.lsp-keymaps")
 require("config.diagnostics")
 require("config.lazy")

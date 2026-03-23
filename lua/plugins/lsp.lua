@@ -86,6 +86,7 @@ return {
 					"html",
 					"cssls",
 				},
+				automatic_enable = true,
 			})
 		end,
 	},
