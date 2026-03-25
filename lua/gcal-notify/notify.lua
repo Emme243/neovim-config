@@ -3,7 +3,7 @@ local calendar = require("gcal-notify.calendar")
 local M = {}
 
 local pulse_timers = {} -- win_id -> timer
-local active_notifications = {} -- event_id -> { notif_id, dismiss_at }
+local active_notifications = {} -- dedup_key -> { notif_id, dismiss_at }
 
 local config = {
 	notify_duration = 300,
@@ -86,6 +86,28 @@ function M.stop_all_pulses()
 	end
 end
 
+--- Extract short account label from email (part before @).
+local function account_label(email)
+	if not email then
+		return nil
+	end
+	return email:match("^([^@]+)") or email
+end
+
+--- Build notification title with account label(s).
+local function build_title(event)
+	local accounts = event.accounts or (event.account and { event.account } or nil)
+	if not accounts or #accounts == 0 then
+		return "Upcoming Meeting"
+	end
+
+	local labels = {}
+	for _, acct in ipairs(accounts) do
+		table.insert(labels, account_label(acct))
+	end
+	return "Upcoming Meeting (" .. table.concat(labels, ", ") .. ")"
+end
+
 --- Build notification message lines for an event.
 local function build_message(event, seconds_remaining)
 	local time_text
@@ -108,17 +130,19 @@ end
 --- Show or update a meeting notification with pulse effect.
 function M.show_meeting(event, seconds_remaining)
 	local notify = require("notify")
+	local key = event.dedup_key or event.id
 	local dismiss_at = os.time() + config.notify_duration
-	local existing = active_notifications[event.id]
+	local existing = active_notifications[key]
 
 	if existing then
 		dismiss_at = existing.dismiss_at
 	end
 
 	local message = build_message(event, seconds_remaining)
+	local title = build_title(event)
 
 	local opts = {
-		title = "Upcoming Meeting",
+		title = title,
 		icon = "⏰",
 		timeout = false,
 		keep = function()
@@ -140,7 +164,7 @@ function M.show_meeting(event, seconds_remaining)
 
 	local notif = notify(message, "warn", opts)
 
-	active_notifications[event.id] = {
+	active_notifications[key] = {
 		notif_id = notif,
 		dismiss_at = dismiss_at,
 	}
@@ -153,19 +177,21 @@ function M.show_test()
 		summary = "Test Meeting - Calendar Integration",
 		start_time = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() + 120),
 		end_time = os.date("!%Y-%m-%dT%H:%M:%SZ", os.time() + 3720),
+		account = "test@example.com",
+		dedup_key = "test-" .. os.time(),
 	}
 	M.show_meeting(fake_event, 120)
 end
 
 --- Check if an event already has an active notification.
-function M.is_active(event_id)
-	local existing = active_notifications[event_id]
+function M.is_active(dedup_key)
+	local existing = active_notifications[dedup_key]
 	if not existing then
 		return false
 	end
 	-- Clean up expired entries
 	if os.time() >= existing.dismiss_at then
-		active_notifications[event_id] = nil
+		active_notifications[dedup_key] = nil
 		return false
 	end
 	return true
@@ -174,9 +200,9 @@ end
 --- Clean up expired notification entries.
 function M.cleanup()
 	local now = os.time()
-	for id, data in pairs(active_notifications) do
+	for key, data in pairs(active_notifications) do
 		if now >= data.dismiss_at then
-			active_notifications[id] = nil
+			active_notifications[key] = nil
 		end
 	end
 end

@@ -4,13 +4,17 @@ local M = {}
 
 local config = {}
 local data_dir = vim.fn.stdpath("data") .. "/gcal-notify"
-local tokens_path = data_dir .. "/tokens.json"
+local accounts_path = data_dir .. "/accounts.json"
+local legacy_tokens_path = data_dir .. "/tokens.json"
 
 local GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 local GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+local USERINFO_URL = "https://www.googleapis.com/oauth2/v2/userinfo"
 local REDIRECT_PORT = 8089
 local REDIRECT_URI = "http://localhost:" .. REDIRECT_PORT
-local SCOPE = "https://www.googleapis.com/auth/calendar.readonly"
+local SCOPE = "https://www.googleapis.com/auth/calendar.readonly https://www.googleapis.com/auth/userinfo.email"
+
+local auth_in_progress = false
 
 function M.setup(opts)
 	config = opts or {}
@@ -29,37 +33,82 @@ function M.read_credentials()
 	return creds
 end
 
-function M.read_tokens()
-	if vim.fn.filereadable(tokens_path) == 0 then
-		return nil
+--- Read all accounts from accounts.json. Triggers legacy migration if needed.
+function M.read_all_accounts()
+	if vim.fn.filereadable(accounts_path) == 1 then
+		local content = vim.fn.readfile(accounts_path)
+		local ok, accounts = pcall(vim.fn.json_decode, table.concat(content, "\n"))
+		if ok and type(accounts) == "table" then
+			return accounts
+		end
 	end
-	local content = vim.fn.readfile(tokens_path)
-	local ok, tokens = pcall(vim.fn.json_decode, table.concat(content, "\n"))
-	if not ok then
-		return nil
+
+	-- Try legacy migration
+	if vim.fn.filereadable(legacy_tokens_path) == 1 then
+		return M._migrate_legacy()
 	end
-	return tokens
+
+	return {}
 end
 
-function M.write_tokens(tokens)
+--- Write full accounts table to accounts.json.
+function M.write_all_accounts(accounts)
 	vim.fn.mkdir(data_dir, "p")
-	local json = vim.fn.json_encode(tokens)
-	local fd = vim.loop.fs_open(tokens_path, "w", 384) -- 0600
+	local json = vim.fn.json_encode(accounts)
+	local fd = vim.loop.fs_open(accounts_path, "w", 384) -- 0600
 	if fd then
 		vim.loop.fs_write(fd, json)
 		vim.loop.fs_close(fd)
 	end
 end
 
-function M.is_authenticated()
-	local tokens = M.read_tokens()
-	return tokens ~= nil and tokens.refresh_token ~= nil
+--- Write tokens for a single account (read-modify-write).
+function M.write_account_tokens(email, tokens)
+	local accounts = M.read_all_accounts()
+	accounts[email] = tokens
+	M.write_all_accounts(accounts)
 end
 
-function M.get_access_token(callback)
-	local tokens = M.read_tokens()
+--- Remove an account by email.
+function M.remove_account(email)
+	local accounts = M.read_all_accounts()
+	if not accounts[email] then
+		return false
+	end
+	accounts[email] = nil
+	M.write_all_accounts(accounts)
+	return true
+end
+
+--- Get list of account emails.
+function M.get_account_list()
+	local accounts = M.read_all_accounts()
+	local list = {}
+	for email, _ in pairs(accounts) do
+		table.insert(list, email)
+	end
+	table.sort(list)
+	return list
+end
+
+--- Check if at least one account is authenticated.
+function M.is_authenticated()
+	local accounts = M.read_all_accounts()
+	for _, tokens in pairs(accounts) do
+		if tokens.refresh_token then
+			return true
+		end
+	end
+	return false
+end
+
+--- Get access token for a specific account.
+function M.get_access_token(email, callback)
+	local accounts = M.read_all_accounts()
+	local tokens = accounts[email]
+
 	if not tokens or not tokens.refresh_token then
-		callback(nil, "Not authenticated. Run :GcalSetup first.")
+		callback(nil, "Account not authenticated: " .. email)
 		return
 	end
 
@@ -86,36 +135,102 @@ function M.get_access_token(callback)
 		headers = { ["Content-Type"] = "application/json" },
 		callback = vim.schedule_wrap(function(response)
 			if response.status ~= 200 then
-				callback(nil, "Token refresh failed (HTTP " .. response.status .. ")")
+				callback(nil, "Token refresh failed for " .. email .. " (HTTP " .. response.status .. ")")
 				return
 			end
 			local ok, data = pcall(vim.fn.json_decode, response.body)
 			if not ok or not data.access_token then
-				callback(nil, "Failed to parse token refresh response")
+				callback(nil, "Failed to parse token refresh response for " .. email)
 				return
 			end
 			tokens.access_token = data.access_token
 			tokens.expiry = os.time() + (data.expires_in or 3600)
-			M.write_tokens(tokens)
+			M.write_account_tokens(email, tokens)
 			callback(tokens.access_token)
 		end),
 	})
 end
 
+--- Get access tokens for all accounts. Returns { {email, token}, ... } via callback.
+--- Skips accounts that fail with a warning.
+function M.get_all_access_tokens(callback)
+	local account_list = M.get_account_list()
+	if #account_list == 0 then
+		callback({})
+		return
+	end
+
+	local results = {}
+
+	local function process_next(index)
+		if index > #account_list then
+			callback(results)
+			return
+		end
+
+		local email = account_list[index]
+		M.get_access_token(email, function(token, err)
+			if token then
+				table.insert(results, { email = email, token = token })
+			else
+				vim.notify(
+					"GCal: skipping " .. email .. ": " .. (err or "unknown error"),
+					vim.log.levels.WARN,
+					{ title = "GCal Notify" }
+				)
+			end
+			process_next(index + 1)
+		end)
+	end
+
+	process_next(1)
+end
+
+--- Fetch the email address for an access token via Google userinfo API.
+function M._fetch_userinfo(access_token, callback)
+	curl.get(USERINFO_URL, {
+		headers = { ["Authorization"] = "Bearer " .. access_token },
+		callback = vim.schedule_wrap(function(response)
+			if response.status ~= 200 then
+				callback(nil, "Userinfo request failed (HTTP " .. response.status .. ")")
+				return
+			end
+			local ok, data = pcall(vim.fn.json_decode, response.body)
+			if not ok or not data.email then
+				callback(nil, "Failed to parse userinfo response")
+				return
+			end
+			callback(data.email)
+		end),
+	})
+end
+
 function M.start_auth_flow()
+	if auth_in_progress then
+		vim.notify("Authorization already in progress", vim.log.levels.WARN, { title = "GCal Notify" })
+		return
+	end
+
 	local creds, err = M.read_credentials()
 	if not creds then
 		vim.notify(err, vim.log.levels.ERROR, { title = "GCal Notify" })
 		return
 	end
 
+	auth_in_progress = true
+
 	local server = vim.loop.new_tcp()
 	server:bind("127.0.0.1", REDIRECT_PORT)
 
 	server:listen(1, function(listen_err)
 		if listen_err then
+			auth_in_progress = false
 			vim.schedule(function()
-				vim.notify("Failed to start auth server: " .. listen_err, vim.log.levels.ERROR, { title = "GCal Notify" })
+				vim.notify(
+					"Failed to start auth server: " .. listen_err,
+					vim.log.levels.ERROR,
+					{ title = "GCal Notify" }
+				)
 			end)
 			return
 		end
@@ -125,6 +240,7 @@ function M.start_auth_flow()
 
 		client:read_start(function(read_err, data)
 			if read_err or not data then
+				auth_in_progress = false
 				client:close()
 				server:close()
 				return
@@ -133,6 +249,7 @@ function M.start_auth_flow()
 			-- Extract authorization code from the GET request
 			local code = data:match("[?&]code=([^&%s]+)")
 			if not code then
+				auth_in_progress = false
 				local error_msg = data:match("[?&]error=([^&%s]+)") or "unknown"
 				local html = "<html><body><h2>Authorization failed: "
 					.. error_msg
@@ -146,7 +263,11 @@ function M.start_auth_flow()
 					server:close()
 				end)
 				vim.schedule(function()
-					vim.notify("Authorization denied: " .. error_msg, vim.log.levels.ERROR, { title = "GCal Notify" })
+					vim.notify(
+						"Authorization denied: " .. error_msg,
+						vim.log.levels.ERROR,
+						{ title = "GCal Notify" }
+					)
 				end)
 				return
 			end
@@ -213,6 +334,7 @@ function M._exchange_code(creds, code)
 		headers = { ["Content-Type"] = "application/json" },
 		callback = vim.schedule_wrap(function(response)
 			if response.status ~= 200 then
+				auth_in_progress = false
 				vim.notify(
 					"Token exchange failed (HTTP " .. response.status .. ")",
 					vim.log.levels.ERROR,
@@ -222,22 +344,61 @@ function M._exchange_code(creds, code)
 			end
 			local ok, data = pcall(vim.fn.json_decode, response.body)
 			if not ok or not data.access_token then
+				auth_in_progress = false
 				vim.notify("Failed to parse token response", vim.log.levels.ERROR, { title = "GCal Notify" })
 				return
 			end
+
 			local tokens = {
 				access_token = data.access_token,
 				refresh_token = data.refresh_token,
 				expiry = os.time() + (data.expires_in or 3600),
 			}
-			M.write_tokens(tokens)
-			vim.notify(
-				"Google Calendar authorized successfully!",
-				vim.log.levels.INFO,
-				{ title = "GCal Notify" }
-			)
+
+			-- Fetch the account email via userinfo API
+			M._fetch_userinfo(data.access_token, function(email, info_err)
+				auth_in_progress = false
+				if email then
+					M.write_account_tokens(email, tokens)
+					vim.notify(
+						"Google Calendar authorized: " .. email,
+						vim.log.levels.INFO,
+						{ title = "GCal Notify" }
+					)
+				else
+					-- Fallback: store under "unknown" if userinfo fails
+					M.write_account_tokens("unknown", tokens)
+					vim.notify(
+						"Authorized, but couldn't fetch email: " .. (info_err or "unknown error"),
+						vim.log.levels.WARN,
+						{ title = "GCal Notify" }
+					)
+				end
+			end)
 		end),
 	})
+end
+
+--- Migrate legacy single-account tokens.json to multi-account accounts.json.
+function M._migrate_legacy()
+	local content = vim.fn.readfile(legacy_tokens_path)
+	local ok, tokens = pcall(vim.fn.json_decode, table.concat(content, "\n"))
+	if not ok or not tokens or not tokens.refresh_token then
+		return {}
+	end
+
+	local accounts = { default = tokens }
+	M.write_all_accounts(accounts)
+
+	vim.defer_fn(function()
+		vim.notify(
+			"GCal Notify: Migrated existing account as \"default\".\nRun :GcalAddAccount to re-authorize with email identification.",
+			vim.log.levels.INFO,
+			{ title = "GCal Notify" }
+		)
+	end, 3000)
+
+	return accounts
 end
 
 return M

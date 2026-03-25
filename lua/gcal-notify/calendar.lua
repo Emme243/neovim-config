@@ -57,7 +57,9 @@ function M.seconds_until(iso_timestamp)
 end
 
 --- Parse events from Google Calendar API response body.
-function M.parse_events(body)
+--- @param body string JSON response body
+--- @param account_email string|nil The account email for tagging events
+function M.parse_events(body, account_email)
 	local ok, data = pcall(vim.fn.json_decode, body)
 	if not ok or not data.items then
 		return {}
@@ -69,14 +71,17 @@ function M.parse_events(body)
 		if item.start and item.start.dateTime then
 			local start_time = item.start.dateTime
 			local end_time = item["end"] and item["end"].dateTime or nil
+			local start_epoch = M.parse_iso8601(start_time)
 
 			table.insert(events, {
 				id = item.id,
 				summary = item.summary or "(No title)",
 				start_time = start_time,
 				end_time = end_time,
-				start_epoch = M.parse_iso8601(start_time),
+				start_epoch = start_epoch,
 				html_link = item.htmlLink,
+				account = account_email,
+				dedup_key = (item.summary or "") .. "|" .. tostring(start_epoch or ""),
 			})
 		end
 	end
@@ -97,8 +102,9 @@ end
 --- @param access_token string
 --- @param calendar_id string
 --- @param minutes_ahead number
+--- @param account_email string|nil The account email for tagging events
 --- @param callback function(events, err)
-function M.fetch_upcoming(access_token, calendar_id, minutes_ahead, callback)
+function M.fetch_upcoming(access_token, calendar_id, minutes_ahead, account_email, callback)
 	local now = os.time()
 	local time_min = os.date("!%Y-%m-%dT%H:%M:%SZ", now)
 	local time_max = os.date("!%Y-%m-%dT%H:%M:%SZ", now + (minutes_ahead * 60))
@@ -118,7 +124,7 @@ function M.fetch_upcoming(access_token, calendar_id, minutes_ahead, callback)
 				callback(nil, "Calendar API error (HTTP " .. response.status .. ")")
 				return
 			end
-			local events = M.parse_events(response.body)
+			local events = M.parse_events(response.body, account_email)
 			callback(events)
 		end),
 	})

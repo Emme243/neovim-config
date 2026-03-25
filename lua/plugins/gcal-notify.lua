@@ -12,5 +12,13 @@ return {
 	keys = {
 		{ "<leader>gc", desc = "Toggle GCal Notifications" },
 	},
-	cmd = { "GcalSetup", "GcalStart", "GcalStop", "GcalTest" },
+	cmd = {
+		"GcalSetup",
+		"GcalAddAccount",
+		"GcalRemoveAccount",
+		"GcalListAccounts",
+		"GcalStart",
+		"GcalStop",
+		"GcalTest",
+	},
 }

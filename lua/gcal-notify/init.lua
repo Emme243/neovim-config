@@ -11,13 +11,14 @@ local defaults = {
 	notify_duration = 300, -- seconds notification stays visible (5 min)
 	pulse_interval = 800, -- ms between pulse toggles
 	calendar_id = "primary",
+	calendar_ids = nil, -- optional: { ["user@gmail.com"] = "cal-id", ... }
 }
 
 local config = {}
 local poll_timer = nil
 local countdown_timer = nil
 local is_running = false
-local pending_events = {} -- events awaiting countdown updates
+local pending_events = {} -- dedup_key -> event
 
 function M.setup(opts)
 	config = vim.tbl_extend("force", defaults, opts or {})
@@ -31,7 +32,19 @@ function M.setup(opts)
 	-- Register commands
 	vim.api.nvim_create_user_command("GcalSetup", function()
 		auth.start_auth_flow()
-	end, { desc = "Authorize Google Calendar access" })
+	end, { desc = "Authorize a Google Calendar account (alias for GcalAddAccount)" })
+
+	vim.api.nvim_create_user_command("GcalAddAccount", function()
+		auth.start_auth_flow()
+	end, { desc = "Authorize a new Google Calendar account" })
+
+	vim.api.nvim_create_user_command("GcalRemoveAccount", function()
+		M._remove_account_interactive()
+	end, { desc = "Remove an authorized Google Calendar account" })
+
+	vim.api.nvim_create_user_command("GcalListAccounts", function()
+		M._list_accounts()
+	end, { desc = "List all authorized Google Calendar accounts" })
 
 	vim.api.nvim_create_user_command("GcalStart", function()
 		M.start()
@@ -73,7 +86,11 @@ function M.start()
 	end
 
 	if not auth.is_authenticated() then
-		vim.notify("Not authenticated. Run :GcalSetup first.", vim.log.levels.WARN, { title = "GCal Notify" })
+		vim.notify(
+			"Not authenticated. Run :GcalAddAccount first.",
+			vim.log.levels.WARN,
+			{ title = "GCal Notify" }
+		)
 		return
 	end
 
@@ -93,7 +110,13 @@ function M.start()
 		M._update_countdowns()
 	end))
 
-	vim.notify("GCal notifications started", vim.log.levels.INFO, { title = "GCal Notify" })
+	local accounts = auth.get_account_list()
+	local count = #accounts
+	vim.notify(
+		"GCal notifications started (" .. count .. " account" .. (count ~= 1 and "s" or "") .. ")",
+		vim.log.levels.INFO,
+		{ title = "GCal Notify" }
+	)
 end
 
 function M.stop()
@@ -130,32 +153,52 @@ function M.toggle()
 	end
 end
 
+--- Get the calendar ID for a given account email.
+local function get_calendar_id(email)
+	if config.calendar_ids and config.calendar_ids[email] then
+		return config.calendar_ids[email]
+	end
+	return config.calendar_id
+end
+
 function M.poll()
 	if not is_running then
 		return
 	end
 
-	auth.get_access_token(function(token, err)
-		if not token then
-			vim.notify(err or "Failed to get access token", vim.log.levels.ERROR, { title = "GCal Notify" })
+	auth.get_all_access_tokens(function(account_tokens)
+		if #account_tokens == 0 then
 			return
 		end
 
-		-- Fetch events for the next 10 minutes
-		calendar.fetch_upcoming(token, config.calendar_id, 10, function(events, fetch_err)
-			if not events then
-				vim.notify(fetch_err or "Failed to fetch events", vim.log.levels.ERROR, { title = "GCal Notify" })
-				return
+		M._fetch_all_events(account_tokens, 1, {}, function(all_events)
+			-- Deduplicate by dedup_key
+			local seen = {}
+			local unique_events = {}
+
+			for _, event in ipairs(all_events) do
+				local key = event.dedup_key
+				if seen[key] then
+					-- Merge account info into existing event
+					local existing = seen[key]
+					if not existing.accounts then
+						existing.accounts = { existing.account }
+					end
+					table.insert(existing.accounts, event.account)
+				else
+					seen[key] = event
+					table.insert(unique_events, event)
+				end
 			end
 
-			for _, event in ipairs(events) do
+			-- Show notifications for events within the notify window
+			for _, event in ipairs(unique_events) do
 				local seconds = calendar.seconds_until(event.start_time)
 				if seconds and seconds <= config.notify_before and seconds > -config.notify_duration then
-					if not notifier.is_active(event.id) then
+					if not notifier.is_active(event.dedup_key) then
 						notifier.show_meeting(event, seconds)
 					end
-					-- Track for countdown updates
-					pending_events[event.id] = event
+					pending_events[event.dedup_key] = event
 				end
 			end
 
@@ -164,21 +207,83 @@ function M.poll()
 	end)
 end
 
+--- Recursively fetch events for each account, accumulating results.
+function M._fetch_all_events(account_tokens, index, accumulated, callback)
+	if index > #account_tokens then
+		callback(accumulated)
+		return
+	end
+
+	local entry = account_tokens[index]
+	local cal_id = get_calendar_id(entry.email)
+
+	calendar.fetch_upcoming(entry.token, cal_id, 10, entry.email, function(events, fetch_err)
+		if events then
+			for _, event in ipairs(events) do
+				table.insert(accumulated, event)
+			end
+		else
+			vim.notify(
+				"GCal: fetch failed for " .. entry.email .. ": " .. (fetch_err or "unknown"),
+				vim.log.levels.WARN,
+				{ title = "GCal Notify" }
+			)
+		end
+
+		M._fetch_all_events(account_tokens, index + 1, accumulated, callback)
+	end)
+end
+
 function M._update_countdowns()
 	if not is_running then
 		return
 	end
 
-	for event_id, event in pairs(pending_events) do
-		if notifier.is_active(event_id) then
+	for dedup_key, event in pairs(pending_events) do
+		if notifier.is_active(dedup_key) then
 			local seconds = calendar.seconds_until(event.start_time)
 			if seconds then
 				notifier.show_meeting(event, seconds)
 			end
 		else
-			pending_events[event_id] = nil
+			pending_events[dedup_key] = nil
 		end
 	end
+end
+
+--- Interactive account removal via vim.ui.select.
+function M._remove_account_interactive()
+	local accounts = auth.get_account_list()
+	if #accounts == 0 then
+		vim.notify("No accounts to remove", vim.log.levels.INFO, { title = "GCal Notify" })
+		return
+	end
+
+	vim.ui.select(accounts, { prompt = "Remove account:" }, function(choice)
+		if not choice then
+			return
+		end
+		if auth.remove_account(choice) then
+			vim.notify("Removed account: " .. choice, vim.log.levels.INFO, { title = "GCal Notify" })
+		else
+			vim.notify("Failed to remove account: " .. choice, vim.log.levels.ERROR, { title = "GCal Notify" })
+		end
+	end)
+end
+
+--- List all authorized accounts.
+function M._list_accounts()
+	local accounts = auth.get_account_list()
+	if #accounts == 0 then
+		vim.notify("No accounts authorized. Run :GcalAddAccount", vim.log.levels.INFO, { title = "GCal Notify" })
+		return
+	end
+
+	local lines = { "Authorized accounts:" }
+	for i, email in ipairs(accounts) do
+		table.insert(lines, string.format("  %d. %s", i, email))
+	end
+	vim.notify(table.concat(lines, "\n"), vim.log.levels.INFO, { title = "GCal Notify" })
 end
 
 return M
