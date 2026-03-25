@@ -8,7 +8,7 @@ local defaults = {
 	credentials_path = vim.fn.stdpath("config") .. "/.gcal-credentials.json",
 	poll_interval = 60, -- seconds between API polls
 	notify_before = 120, -- seconds before meeting to notify (2 min)
-	notify_duration = 300, -- seconds notification stays visible (5 min)
+	notify_duration = 120, -- seconds notification stays visible (2 min, matches notify_before)
 	pulse_interval = 800, -- ms between pulse toggles
 	calendar_id = "primary",
 	calendar_ids = nil, -- optional: { ["user@gmail.com"] = "cal-id", ... }
@@ -19,6 +19,7 @@ local poll_timer = nil
 local countdown_timer = nil
 local is_running = false
 local pending_events = {} -- dedup_key -> event
+local notified_keys = {} -- dedup_key -> true; tracks events already notified
 
 function M.setup(opts)
 	config = vim.tbl_extend("force", defaults, opts or {})
@@ -141,6 +142,7 @@ function M.stop()
 	notifier.stop_all_pulses()
 	notifier.cleanup()
 	pending_events = {}
+	notified_keys = {}
 
 	vim.notify("GCal notifications stopped", vim.log.levels.INFO, { title = "GCal Notify" })
 end
@@ -192,13 +194,23 @@ function M.poll()
 			end
 
 			-- Show notifications for events within the notify window
+			local current_keys = {}
 			for _, event in ipairs(unique_events) do
 				local seconds = calendar.seconds_until(event.start_time)
 				if seconds and seconds <= config.notify_before and seconds > -config.notify_duration then
-					if not notifier.is_active(event.dedup_key) then
+					current_keys[event.dedup_key] = true
+					if not notified_keys[event.dedup_key] and not notifier.is_active(event.dedup_key) then
 						notifier.show_meeting(event, seconds)
+						notified_keys[event.dedup_key] = true
 					end
 					pending_events[event.dedup_key] = event
+				end
+			end
+
+			-- Purge notified_keys for events no longer in the window
+			for key in pairs(notified_keys) do
+				if not current_keys[key] then
+					notified_keys[key] = nil
 				end
 			end
 

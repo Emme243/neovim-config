@@ -141,13 +141,11 @@ function M.show_meeting(event, seconds_remaining)
 	local message = build_message(event, seconds_remaining)
 	local title = build_title(event)
 
+	local remaining_ms = math.max((dismiss_at - os.time()) * 1000, 1000)
 	local opts = {
 		title = title,
 		icon = "⏰",
-		timeout = false,
-		keep = function()
-			return os.time() < dismiss_at
-		end,
+		timeout = remaining_ms,
 		on_open = function(win)
 			vim.api.nvim_win_set_config(win, { zindex = 200 })
 			M.start_pulse(win)
